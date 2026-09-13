@@ -12,6 +12,8 @@ Parameters:
 
 - `key` - The key to store.
 - `value` - The value associated with the key.
+- `ttl_seconds` - Optional number of seconds before the key expires. It must be
+  greater than zero.
 
 For example:
 
@@ -27,6 +29,18 @@ This stores:
 ```
 
 alongside any existing key-value pairs.
+
+To store a key for five minutes, set `ttl_seconds` to `300`:
+
+```text
+key: session
+value: abc123
+ttl_seconds: 300
+```
+
+Updating a key without `ttl_seconds` makes it persistent, even if it previously
+had an expiration time. A zero or negative `ttl_seconds` value returns a `422`
+response.
 
 ### GET `/db`
 
@@ -44,4 +58,5 @@ returns:
 Alice
 ```
 
-If the requested key does not exist, the API returns a `404` response.
+If the requested key does not exist or has expired, the API returns a `404`
+response. Expired keys are removed when they are requested.
