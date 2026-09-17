@@ -21,3 +21,6 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+      - name: Check benchmark correctness without timing
+        run: uv run --locked --group benchmark pytest benchmarks --benchmark-disable
