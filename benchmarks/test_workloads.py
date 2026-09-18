@@ -25,20 +25,24 @@ def test_mixed_resident(
     entries: Entries,
     measured_rounds: int,
 ) -> None:
+    """Measure a shuffled in-memory workload of 90% reads and 10% overwrites."""
     operations = mixed_operations(entries)
     expected = expected_state(entries, operations)
     expected_reads = [value for action, _, value in operations if action == "read"]
     values: list[str] = []
 
     def run():
+        """Execute the whole mixed workload while the timer runs."""
         nonlocal values
         values = run_operations(loaded_cache, operations)
 
     def restore_entries():
+        """Undo prior overwrites before each warmup or measured round."""
         for key, value in entries:
             loaded_cache.insert(key, value)
 
     def verify():
+        """Check read results and final in-memory state after timing stops."""
         assert values == expected_reads
         assert_entries(loaded_cache, expected)
 
@@ -47,6 +51,7 @@ def test_mixed_resident(
         writes=len(entries) - len(expected_reads),
         persistence="in-memory only",
     )
+    # Reset and verification are intentionally outside the timed run callback.
     benchmark.pedantic(
         run,
         setup=restore_entries,
@@ -54,6 +59,8 @@ def test_mixed_resident(
         rounds=measured_rounds,
         warmup_rounds=WARMUP_ROUNDS,
     )
+    # Persist once after all samples so this in-memory benchmark also proves that
+    # its final state can be written and reopened correctly.
     verify()
     loaded_cache.flush()
     verify_persisted(database_file, expected)

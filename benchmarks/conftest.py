@@ -20,6 +20,7 @@ EXTENDED_DATASETS = [(10_000, 32), (100_000, 32)]
 
 
 def _positive_int(value: str) -> int:
+    """Parse a command-line value that must be at least one."""
     number = int(value)
     if number < 1:
         raise ArgumentTypeError("must be a positive integer")
@@ -27,6 +28,7 @@ def _positive_int(value: str) -> int:
 
 
 def pytest_addoption(parser):
+    """Register command-line controls used only by the benchmark suite."""
     group = parser.getgroup("seriousdb benchmarks")
     group.addoption(
         "--extended", action="store_true", help="Add 10k/100k SeriousDB datasets."
@@ -40,6 +42,7 @@ def pytest_addoption(parser):
 
 
 def pytest_generate_tests(metafunc):
+    """Run every benchmark that requests entries against each selected dataset."""
     if "entries" not in metafunc.fixturenames:
         return
     datasets = DEFAULT_DATASETS.copy()
@@ -58,11 +61,13 @@ def pytest_generate_tests(metafunc):
 
 @pytest.fixture
 def measured_rounds(request) -> int:
+    """Return the requested number of timed samples for each scenario."""
     return request.config.getoption("--engine-rounds")
 
 
 @pytest.fixture
 def entries(request, benchmark) -> Entries:
+    """Build one dataset and attach its shape to the saved benchmark result."""
     count, value_bytes = request.param
     benchmark.extra_info.update(
         entries=count,
@@ -78,10 +83,12 @@ def entries(request, benchmark) -> Entries:
 
 @pytest.fixture
 def database_file(tmp_path: Path) -> Path:
+    """Give each test an isolated database path that pytest removes afterward."""
     return tmp_path / "database.json"
 
 
 @pytest.fixture
 def loaded_cache(database_file: Path, entries: Entries):
+    """Provide a populated cache when loading is setup rather than timed work."""
     write_database(database_file, entries)
     return load_cache(str(database_file))

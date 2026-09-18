@@ -23,11 +23,16 @@ def test_batch_write_and_persist(
     entries: Entries,
     measured_rounds: int,
 ) -> None:
+    """Measure creating a database, inserting every entry, and flushing once."""
+
     def prepare_database():
+        """Remove the last round's file before the next timer starts."""
         database_file.unlink(missing_ok=True)
         return (database_file, entries), {}
 
     benchmark.extra_info["persistence"] = "Cache.flush without fsync"
+    # For each round pytest-benchmark runs prepare_database outside the timer,
+    # times write_database, then calls verify_persisted after the timer stops.
     benchmark.pedantic(
         write_database,
         setup=prepare_database,
@@ -48,18 +53,22 @@ def test_flush(
     entries: Entries,
     measured_rounds: int,
 ) -> None:
+    """Measure serializing and flushing an already loaded cache to its file."""
     expected = dict(entries)
     changed_key = entries[0][0]
 
     def prepare_flush():
-        # Alternate a same-sized value so every round must update the file.
+        """Change one value outside timing so flush has new state to persist."""
+        # Keeping the value the same size avoids changing the workload each round.
         expected[changed_key] = expected[changed_key][::-1]
         loaded_cache.insert(changed_key, expected[changed_key])
 
     def verify():
+        """Reopen the file outside timing and check the changed value arrived."""
         verify_persisted(database_file, tuple(expected.items()))
 
     benchmark.extra_info["persistence"] = "Cache.flush without fsync"
+    # Only loaded_cache.flush is timed; mutation and disk verification are not.
     benchmark.pedantic(
         loaded_cache.flush,
         setup=prepare_flush,
@@ -86,6 +95,7 @@ def test_update_and_persist(
     measured_rounds: int,
     flush_every: int,
 ) -> None:
+    """Measure 100 overwrites with either one flush per write or one per batch."""
     # A fixed operation count isolates the cost of the existing database size.
     originals = entries[:100]
     updates = tuple((key, value[::-1]) for key, value in originals)
@@ -94,9 +104,11 @@ def test_update_and_persist(
     expected_entries = tuple(expected.items())
 
     def restore_database():
+        """Restore original values before each warmup or measured round."""
         write_entries(loaded_cache, originals, len(originals))
 
     def verify(cache, _changed_entries, _frequency):
+        """Check the in-memory state and reopened file after timing stops."""
         assert_entries(cache, expected_entries)
         verify_persisted(database_file, expected_entries)
 
@@ -105,6 +117,8 @@ def test_update_and_persist(
         flush_every=flush_every,
         persistence="Cache.flush without fsync",
     )
+    # write_entries is the timed target. Its arguments are also passed to the
+    # teardown callback, matching pytest-benchmark's pedantic callback contract.
     benchmark.pedantic(
         write_entries,
         args=(loaded_cache, updates, flush_every),

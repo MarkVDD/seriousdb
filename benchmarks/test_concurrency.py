@@ -30,6 +30,8 @@ def test_shared_cache_threads(
     measured_rounds: int,
     workers: int,
 ) -> None:
+    """Measure threads running disjoint parts of one workload on a shared cache."""
+    # Slicing distributes every nth operation to a worker without duplicating work.
     operations = mixed_operations(entries)
     chunks = [operations[index::workers] for index in range(workers)]
     expected = expected_state(entries, operations)
@@ -40,14 +42,17 @@ def test_shared_cache_threads(
     values: list[list[str]] = []
 
     def worker(chunk: Operations):
+        """Wait for every worker, then run this worker's share of operations."""
         start.wait()
         return run_operations(loaded_cache, chunk)
 
     def restore_entries():
+        """Undo prior overwrites before each warmup or measured round."""
         for key, value in entries:
             loaded_cache.insert(key, value)
 
     def verify():
+        """Check each worker's reads and the shared cache after timing stops."""
         assert values == expected_reads
         assert_entries(loaded_cache, expected)
 
@@ -58,9 +63,12 @@ def test_shared_cache_threads(
         writes=len(entries) // 10,
         persistence="in-memory only; final flush outside timing",
     )
+    # Pool startup is excluded so the samples focus on scheduling work and on
+    # contention inside one shared Cache rather than thread construction.
     with ThreadPoolExecutor(max_workers=workers) as executor:
 
         def run_threads():
+            """Submit all chunks, wait for completion, and collect read results."""
             nonlocal values
             futures = [executor.submit(worker, chunk) for chunk in chunks]
             values = [future.result(timeout=60) for future in futures]
@@ -72,7 +80,8 @@ def test_shared_cache_threads(
             rounds=measured_rounds,
             warmup_rounds=WARMUP_ROUNDS,
         )
-    # Submission, barrier synchronization and joins are timed. Pool creation is not.
+    # Submission, barrier synchronization, and joins happen in run_threads, so
+    # they are included in each sample. Reset and verification stay outside it.
     verify()
     loaded_cache.flush()
     verify_persisted(database_file, expected)

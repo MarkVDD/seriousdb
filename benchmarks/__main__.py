@@ -6,6 +6,7 @@ import pytest
 
 
 def main() -> int:
+    """Run benchmarks with stable display settings and save the raw samples."""
     return pytest.main(
         [
             "benchmarks",

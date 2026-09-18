@@ -24,21 +24,26 @@ def test_load_and_read_by_key(
     entries: Entries,
     measured_rounds: int,
 ) -> None:
+    """Measure opening the file and reading every key as one user operation."""
+    # File creation belongs to setup, so it happens once before benchmarking.
     write_database(database_file, entries)
     values: list[str] = []
     expected = [value for _, value in entries]
 
     def read():
+        """Load a new Cache from disk and read all keys while the timer runs."""
         nonlocal values
         values = load_and_read(database_file, entries)
 
     def verify():
+        """Check the completed round's read results after the timer stops."""
         assert values == expected
 
     benchmark.extra_info.update(
         file_bytes=database_file.stat().st_size,
         lookup="native string key",
     )
+    # No per-round setup is needed because this benchmark never mutates the file.
     benchmark.pedantic(
         read,
         teardown=verify,
@@ -55,15 +60,18 @@ def test_load_file(
     entries: Entries,
     measured_rounds: int,
 ) -> None:
+    """Measure reading and deserializing a database file without key lookups."""
     filename = loaded_cache.filename
     assert filename is not None
     cache: Cache | None = None
 
     def load():
+        """Create a new Cache and load the file while the timer runs."""
         nonlocal cache
         cache = load_cache(filename)
 
     def verify():
+        """Read the loaded cache outside timing to prove deserialization worked."""
         assert cache is not None
         assert_entries(cache, entries)
 
@@ -83,14 +91,17 @@ def test_resident_read(
     entries: Entries,
     measured_rounds: int,
 ) -> None:
+    """Measure reading every key after the database is already in memory."""
     values: list[str] = []
     expected = [value for _, value in entries]
 
     def read():
+        """Read all requested keys from the existing Cache inside the timer."""
         nonlocal values
         values = read_resident(loaded_cache, entries)
 
     def verify():
+        """Check the completed round's read results after the timer stops."""
         assert values == expected
 
     benchmark.pedantic(
