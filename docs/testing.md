@@ -22,7 +22,7 @@ Each test uses an isolated temporary database so the test suite does not modify 
 ## Performance benchmarks
 
 Benchmarks measure `Cache` directly, excluding HTTP. Inputs use seed 212, with
-one untimed warmup and five measured rounds. Default datasets are 100 and 1,000
+one unrecorded warmup and five measured rounds. Default datasets are 100 and 1,000
 entries with 32-byte values, plus 1,000 with 1,024-byte values. `--extended` adds
 10,000 and 100,000 entries with 32-byte values.
 
