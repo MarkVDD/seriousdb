@@ -6,6 +6,8 @@ on:
       - opened
       - reopened
       - edited
+      - synchronize
+      - labeled
       - ready_for_review
 
 permissions:
@@ -50,7 +52,6 @@ jobs:
               `query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $number) {
-                    id
                     state
                     isDraft
                     authorAssociation
@@ -201,17 +202,17 @@ jobs:
               commentMarker,
               `Thanks for the contribution, @${author}.`,
               "",
-              `This pull request has been moved to Draft because ${reason}.`,
+              `This pull request does not meet the assignment policy because ` +
+                `${reason}.`,
               "",
               "Please read the " +
                 `[contribution guide](${contributionGuide}), request ` +
-                "assignment on the issue, and mark the pull request ready " +
-                "for review again once the assignment is in place.",
+                "assignment on the issue, and then edit this pull request or " +
+                "push a commit to run the check again.",
               "",
               "If you believe this was flagged incorrectly, please contact " +
                 "a maintainer. Maintainers can apply the " +
-                `\`${exemptionLabel}\` label and mark the pull request ` +
-                "ready for review when assignment is not required.",
+                `\`${exemptionLabel}\` label when assignment is not required.`,
             ].join("\n");
             const comments = await github.paginate(
               github.rest.issues.listComments,
@@ -241,15 +242,6 @@ jobs:
               });
             }
 
-            await github.graphql(
-              `mutation($pullRequestId: ID!) {
-                convertPullRequestToDraft(
-                  input: {pullRequestId: $pullRequestId}
-                ) {
-                  pullRequest {
-                    isDraft
-                  }
-                }
-              }`,
-              {pullRequestId: pullRequest.id},
+            core.setFailed(
+              "The pull request does not meet the issue assignment policy.",
             );
