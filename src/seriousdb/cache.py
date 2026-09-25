@@ -3,8 +3,8 @@
 The whole database is held in memory as a ``dict``. Writes are durably
 appended to a :class:`~seriousdb.wal.WriteAheadLog` before returning, and periodically
 compacted into the full JSON snapshot file (see :data:`COMPACTION_THRESHOLD`).
-All access to the data is guarded by a lock, so a single :class:`Cache` can
-be shared between request handlers.
+All access to the data is guarded by a thread lock. File changes also hold a
+sidecar lock shared by processes using the same database path.
 """
 
 import json
@@ -16,7 +16,8 @@ from collections.abc import Iterable
 from threading import Lock
 
 from .exceptions import ResourceNotFoundError, ServiceUnavailableError
-from .wal import DeleteEntry, SetEntry, WalEntry, WriteAheadLog
+from .process_lock import locked_database
+from .wal import DeleteEntry, SetEntry, WriteAheadLog, _sync_parent_directory
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ class Cache:
     A new cache holds no data. Call :meth:`load` before using it; until then
     every data access raises
     :class:`~seriousdb.exceptions.ServiceUnavailableError`.
+    Writes refresh the snapshot and WAL under a process lock. Reads may retain
+    an older in-memory view until this cache writes or loads again.
 
     Attributes
     ----------
@@ -51,6 +54,8 @@ class Cache:
         self.db: dict[str, str] | None = None
         self.lock = Lock()
         self._writes_since_compact: int = 0
+        self._snapshot_identity: tuple[int, int, int, int] | None = None
+        self._seen_wal_offset = 0
 
     def insert(self, key: str, value: str) -> tuple[str, bool]:
         """Store `value` under `key`, replacing any existing value.
@@ -83,11 +88,17 @@ class Cache:
             If the write-ahead log cannot be written. `self.db` is left unchanged in this case.
         """
         with self.lock:
-            db = require_db(self)
-            is_new_key = key not in db
-            self._record_write(SetEntry(key=key, value=value))
-            db[key] = value
-            self._safe_maybe_compact()
+            filename = require_filename(self)
+            with locked_database(filename):
+                db, wal, count, snapshot_identity = self._state_for_write(filename)
+                is_new_key = key not in db
+                wal.append(SetEntry(key=key, value=value))
+                db[key] = value
+                self.db, self.wal = db, wal
+                self._writes_since_compact = count + 1
+                self._snapshot_identity = snapshot_identity
+                self._seen_wal_offset = wal._offset
+                self._safe_maybe_compact()
         return value, is_new_key
 
     def select(self, key: str) -> str:
@@ -145,12 +156,18 @@ class Cache:
             If the write-ahead log cannot be written. `self.db` is left unchanged in this case.
         """
         with self.lock:
-            db = require_db(self)
-            val = db.get(key, None)
-            if val is not None:
-                self._record_write(DeleteEntry(key=key))
-                db.pop(key, None)
-                self._safe_maybe_compact()
+            filename = require_filename(self)
+            with locked_database(filename):
+                db, wal, count, snapshot_identity = self._state_for_write(filename)
+                val = db.get(key, None)
+                if val is not None:
+                    wal.append(DeleteEntry(key=key))
+                    db.pop(key, None)
+                    self.db, self.wal = db, wal
+                    self._writes_since_compact = count + 1
+                    self._snapshot_identity = snapshot_identity
+                    self._seen_wal_offset = wal._offset
+                    self._safe_maybe_compact()
         if val is None:
             logger.debug("Key not found: %s", key)
             raise ResourceNotFoundError(f"No value set for key {key}")
@@ -293,39 +310,14 @@ class Cache:
         OSError
             If the file cannot be read, renamed or written.
         """
-        with self.lock:
-            if not os.path.isfile(filename):
-                logger.info(
-                    "Database file %s does not exist; creating a new database",
-                    filename,
-                )
-                self.db = _write_default(filename)
-            else:
-                try:
-                    with open(filename, "rb") as f:
-                        self.db = json.loads(f.read().decode())
-                        if not isinstance(self.db, dict):
-                            raise TypeError(
-                                f"expected dict, got {type(self.db).__name__}"
-                            )
-                        logger.info("Loaded database from %s", filename)
-
-                except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
-                    backup = _generate_corrupt_backup_path(filename)
-                    os.replace(filename, backup)
-                    logger.warning(
-                        "Corrupt database file %s (%s); moved to %s and starting fresh",
-                        filename,
-                        e,
-                        backup,
-                    )
-                    self.db = _write_default(filename)
+        filename = os.path.realpath(os.path.abspath(filename))
+        with self.lock, locked_database(filename):
+            db, wal, count = _read_state(filename)
             self.filename = filename
-            self.wal = WriteAheadLog(f"{filename}.wal")
-            replayed = self.wal.replay()
-            self._writes_since_compact = len(replayed)
-            for entry in replayed:
-                entry.apply(require_db(self))
+            self.db, self.wal = db, wal
+            self._writes_since_compact = count
+            self._snapshot_identity = _snapshot_identity(filename)
+            self._seen_wal_offset = wal._offset
 
     def flush(self) -> None:
         """No-op, kept for backward compatibility.
@@ -338,25 +330,33 @@ class Cache:
 
     # ------ Write-ahead log orchestration -----------------------------------------#
 
-    def _record_write(self, entry: WalEntry) -> None:
-        """Append `entry` to the write-ahead log and bump the write counter.
+    def _state_for_write(
+        self, filename: str
+    ) -> tuple[dict[str, str], WriteAheadLog, int, tuple[int, int, int, int]]:
+        """Catch up with other writers without rereading an unchanged snapshot."""
+        wal = require_wal(self)
+        identity = _snapshot_identity(filename)
+        wal_exists = os.path.isfile(wal.filename)
+        wal_size = os.path.getsize(wal.filename) if wal_exists else 0
+        if (
+            identity != self._snapshot_identity
+            or wal_size < self._seen_wal_offset
+            or (not wal_exists and self._seen_wal_offset > 0)
+        ):
+            db, wal, count = _read_state(filename, wal)
+            return db, wal, count, _snapshot_identity(filename)
 
-        Must be called, and must succeed, before `entry` is applied to `self.db`,
-        a failed append must never leave memory and the log disagreeing about
-        what happened.
+        if wal_size > self._seen_wal_offset:
+            replayed = wal.replay()
+            if len(replayed) < self._writes_since_compact:
+                db, wal, count = _read_state(filename, wal)
+                return db, wal, count, _snapshot_identity(filename)
+            db = require_db(self).copy()
+            for entry in replayed[self._writes_since_compact:]:
+                entry.apply(db)
+            return db, wal, len(replayed), identity
 
-        Parameters
-        ----------
-        entry : WalEntry
-                    The entry to append.
-
-        Raises
-        ------
-        OSError
-            If the write-ahead log cannot be written.
-        """
-        require_wal(self).append(entry)
-        self._writes_since_compact += 1
+        return require_db(self), wal, self._writes_since_compact, identity
 
     def _safe_maybe_compact(self) -> None:
         """Compact if due, isolating a compaction failure from the caller.
@@ -365,6 +365,7 @@ class Cache:
         write-ahead log, so the write itself is safe regardless of whether
         compaction succeeds, a compaction failure must not make the
         write that triggered it look like it failed too.
+        The caller holds both the thread and process locks.
         """
         try:
             if self._writes_since_compact >= COMPACTION_THRESHOLD:
@@ -376,6 +377,8 @@ class Cache:
 
     def _compact(self) -> None:
         """Write `self.db` to `self.filename` and clear the write-ahead log.
+
+        The caller holds both the thread and process locks.
 
         Both the snapshot and the emptied WAL are written atomically via a temporary
         file and `os.replace`, in that order, so a crash at any point during compaction
@@ -398,6 +401,8 @@ class Cache:
             self.wal.clear()
 
         self._writes_since_compact = 0
+        self._snapshot_identity = _snapshot_identity(self.filename)
+        self._seen_wal_offset = 0
 
 
 def _atomic_write_json(filename: str, data: dict[str, str]) -> None:
@@ -412,24 +417,65 @@ def _atomic_write_json(filename: str, data: dict[str, str]) -> None:
         If the temporary or final files cannot be written.
     """
     dir_name = os.path.dirname(filename) or "."
-    with tempfile.NamedTemporaryFile("wb", dir=dir_name, delete=False) as tmp_file:
-        try:
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=dir_name, delete=False) as tmp_file:
+            temp_name = tmp_file.name
             tmp_file.write(json.dumps(data).encode())
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        except Exception:
-            os.unlink(tmp_file.name)
-            raise
-    try:
-        os.replace(tmp_file.name, filename)
-    except OSError:
-        os.unlink(tmp_file.name)
+        os.replace(temp_name, filename)
+        _sync_parent_directory(filename)
+    except Exception:
+        if temp_name is not None and os.path.lexists(temp_name):
+            os.unlink(temp_name)
         raise
 
 
 def _write_default(filename: str) -> dict[str, str]:
     _atomic_write_json(filename, DEFAULT_DB)
     return dict(DEFAULT_DB)
+
+
+def _snapshot_identity(filename: str) -> tuple[int, int, int, int]:
+    """Identify the current snapshot, which compaction replaces atomically."""
+    stat = os.stat(filename)
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _read_state(
+    filename: str, wal: WriteAheadLog | None = None
+) -> tuple[dict[str, str], WriteAheadLog, int]:
+    """Read the current snapshot and WAL while the database lock is held."""
+    if not os.path.isfile(filename):
+        logger.info(
+            "Database file %s does not exist; creating a new database", filename
+        )
+        db = _write_default(filename)
+    else:
+        try:
+            with open(filename, "rb") as f:
+                db = json.loads(f.read().decode())
+            if not isinstance(db, dict):
+                raise TypeError(f"expected dict, got {type(db).__name__}")
+            logger.info("Loaded database from %s", filename)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
+            backup = _generate_corrupt_backup_path(filename)
+            os.replace(filename, backup)
+            logger.warning(
+                "Corrupt database file %s (%s); moved to %s and starting fresh",
+                filename,
+                e,
+                backup,
+            )
+            db = _write_default(filename)
+
+    if wal is None or wal.filename != f"{filename}.wal":
+        wal = WriteAheadLog(f"{filename}.wal")
+    replayed = wal.replay()
+    for entry in replayed:
+        entry.apply(db)
+    return db, wal, len(replayed)
 
 
 def _generate_corrupt_backup_path(filename: str) -> str:
@@ -486,6 +532,14 @@ def require_db(cache: Cache) -> dict[str, str]:
         )
 
     return cache.db
+
+
+def require_filename(cache: Cache) -> str:
+    """Return the path of a loaded cache while its thread lock is held."""
+    require_db(cache)
+    if cache.filename is None:
+        raise ServiceUnavailableError("Database file has not been loaded")
+    return cache.filename
 
 
 def require_wal(cache: Cache) -> WriteAheadLog:
