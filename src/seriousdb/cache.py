@@ -352,7 +352,7 @@ class Cache:
                 db, wal, count = _read_state(filename, wal)
                 return db, wal, count, _snapshot_identity(filename)
             db = require_db(self).copy()
-            for entry in replayed[self._writes_since_compact:]:
+            for entry in replayed[self._writes_since_compact :]:
                 entry.apply(db)
             return db, wal, len(replayed), identity
 
