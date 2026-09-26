@@ -20,7 +20,7 @@ before the in-memory dictionary changes or the request completes. Loading, WAL r
 the same process lock. Reads may remain stale until this process writes or reloads.
 
 The `.sdb` file itself is not rewritten on every write. Instead, once a fixed number of writes have
-accumulated in the WAL (see `COMPACTION_THRESHOLD` in `cache.py`), the current in-memory state is
+accumulated in the WAL (see `COMPACTION_THRESHOLD` in `persistence.py`), the current in-memory state is
 written atomically (via a temporary file and rename), so a process interruption during compaction leaves
 either the previous snapshot with its WAL intact, or the new snapshot with an empty WAL, and never a
 partially written or corrupted file.

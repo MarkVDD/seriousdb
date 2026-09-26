@@ -4,7 +4,7 @@ import multiprocessing
 
 import pytest
 
-import seriousdb.cache as cache_module
+import seriousdb.persistence as persistence_module
 import seriousdb.wal as wal_module
 from seriousdb.cache import COMPACTION_THRESHOLD, Cache
 from seriousdb.exceptions import ResourceNotFoundError
@@ -76,6 +76,36 @@ def test_delete_uses_latest_durable_value(tmp_path):
         reloaded.select("key")
 
 
+def test_unexpected_compaction_failure_keeps_refreshed_cache_consistent(
+    tmp_path, monkeypatch
+):
+    path = str(tmp_path / "shared.sdb")
+    first = Cache()
+    second = Cache()
+    first.load(path)
+    second.load(path)
+    expected = {
+        f"other-{index}": str(index) for index in range(COMPACTION_THRESHOLD - 1)
+    }
+    for key, value in expected.items():
+        second.insert(key, value)
+
+    def fail(_data):
+        raise RuntimeError("unexpected compaction failure")
+
+    assert first._persistence is not None
+    with monkeypatch.context() as patch:
+        patch.setattr(first._persistence, "_compact", fail)
+        with pytest.raises(RuntimeError, match="unexpected compaction failure"):
+            first.insert("mine", "kept")
+
+    first.insert("next", "kept")
+    expected.update({"mine": "kept", "next": "kept"})
+    reloaded = Cache()
+    reloaded.load(path)
+    assert reloaded.db == expected
+
+
 def test_failed_append_keeps_local_view_and_releases_process_lock(
     tmp_path, monkeypatch
 ):
@@ -127,7 +157,7 @@ def test_snapshot_sync_failure_preserves_wal(tmp_path, monkeypatch):
     def fail(_path):
         raise OSError("directory sync failed")
 
-    monkeypatch.setattr(cache_module, "_sync_parent_directory", fail, raising=False)
+    monkeypatch.setattr(persistence_module, "_sync_parent_directory", fail)
     for index in range(COMPACTION_THRESHOLD):
         cache.insert(f"key-{index}", str(index))
 
